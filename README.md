@@ -91,141 +91,211 @@ Problem6b/
 
 ## 4. The Modular Implementation
 
-Here is an in-depth breakdown of the major functions within each file:
+Here is a highly detailed, line-by-line breakdown of the critical code blocks that power the project.
 
-### 4.1 `config.py` - Configuration and Ollama Interface
-* **`check_ollama(required_models)`**: Runs an HTTP request to `localhost:11434/api/tags` to verify the local daemon is running and has the required `llama3.1` and `nomic-embed-text` models downloaded.
-```python
-def check_ollama(required_models: list[str]) -> bool:
-    try:
-        r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
-        r.raise_for_status()
-        pulled = {m["name"].split(":")[0] for m in r.json().get("models", [])}
-        # Checks if base model names match required ones
-        ...
-```
-* **`_ollama_complete(system, history)`**: A wrapper for `ChatOllama.invoke`. It takes a system prompt string and a list of LangChain message objects (`HumanMessage`, `AIMessage`), prepends the system prompt as a `SystemMessage`, and directly queries the local LLM.
-```python
-def _ollama_complete(system: str, history: list[AnyMessage]) -> str:
-    llm = ChatOllama(model=CHAT_MODEL, base_url=OLLAMA_BASE_URL)
-    messages = [SystemMessage(content=system)] + history
-    return llm.invoke(messages).content
-```
+### 4.1 `config.py` - Configuration and LLM Interface
 
-### 4.2 `memory.py` - Persistent Vector Storage
-* **`OllamaChromaEF`**: A custom embedding function class wrapping `langchain_ollama.OllamaEmbeddings` so ChromaDB can use local Nomic embeddings.
-```python
-class OllamaChromaEF(EmbeddingFunction):
-    def __init__(self, model=EMBED_MODEL, base_url=OLLAMA_BASE_URL):
-        self._emb = OllamaEmbeddings(model=model, base_url=base_url)
+This file centralizes all global constants, system prompts, and handles the direct HTTP interactions with the local Ollama LLM.
 
-    def __call__(self, input: Documents) -> Embeddings:
-        return self._emb.embed_documents(list(input))
-```
-* **`LongTermMemory`**:
-  * **`retrieve(user_id, query)`**: Performs a semantic search against the database using `where={"user_id": user_id}` as a metadata filter.
+* **Checking Ollama Readiness**:
+  Before the application can run, it verifies that the Ollama service is active and has the correct models.
   ```python
-  results = self.col.query(
-      query_texts=[query],
-      n_results=min(n, self.col.count()),
-      where={"user_id": user_id} # Ensures isolation
-  )
-  ```
-  * **`store(user_id, facts, session_id)`**: Uses ChromaDB's `upsert` mechanism with a deterministic `doc_id` to prevent duplicate fact entries.
-  ```python
-  doc_id = f"{user_id}_{session_id}"
-  self.col.upsert(
-      ids=[doc_id],
-      documents=[facts],
-      metadatas=[{"user_id": user_id, "session_id": session_id, ...}]
-  )
+  def check_ollama(required_models: list[str]) -> bool:
+      # Pings the local Ollama API to see if the daemon is running
+      r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+      r.raise_for_status()
+      
+      # Extracts the names of the models currently downloaded
+      pulled = {m["name"].split(":")[0] for m in r.json().get("models", [])}
+      
+      # Checks if both llama3.1 (chat) and nomic-embed-text (embeddings) are present
+      missing = [m for m in required_models if m.split(":")[0] not in pulled]
+      if missing: return False
+      return True
   ```
 
-### 4.3 `graph.py` - LangGraph Flow and Logic
+* **The Core LLM Wrapper (`_ollama_complete`)**:
+  LangChain's `ChatOllama` object expects an array of Message objects (`SystemMessage`, `HumanMessage`, `AIMessage`). This function constructs that array.
+  ```python
+  def _ollama_complete(system: str, history: list[AnyMessage]) -> str:
+      # Prepend the system instructions to the start of the chat history
+      msgs = [SystemMessage(content=system)] + list(history)
+      
+      # Invoke the model. This is a blocking call that generates the response text
+      response = _llm.invoke(msgs)
+      
+      # Extract just the raw text string from the AIMessage object
+      return response.content.strip()
+  ```
 
-LangGraph makes the conversation structure explicit and inspectable. Here is the topology of our state machine:
+### 4.2 `memory.py` - Persistent Vector Storage (Layer 3)
 
-```text
-          ┌──────────┐
-          │ load_ltm │  ← Reads ChromaDB on first turn of session
-          └────┬─────┘
-               │
-          ┌────▼─────┐
-          │   chat   │  ← Core inference (Layer 1: sliding window)
-          └────┬─────┘
-               │
-        ┌──────▼──────┐
-        │   router    │  ← len(messages) > WINDOW_SIZE?
-        └──────┬──────┘
-       yes     │     no
-       ┌───────▼───┐  └────────────────► END
-       │ summarise │  (Layer 2: Compresses older messages)
-       └───────────┘
-             │
-            END
-```
+This module handles ChromaDB, the local vector database used for persisting data across multiple sessions.
 
-* **`AgentState`**: A `TypedDict` defining the graph's memory structure using LangGraph's `add_messages` reducer.
-```python
-class AgentState(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
-    summary: str
-    user_id: str
-    session_id: str
-    lt_context: str
-    turn_count: int
-```
-* **`node_load_ltm`**: The entry point. Checks `state["turn_count"]` to pull from ChromaDB only on the first turn.
-```python
-def _load_ltm(state: AgentState) -> dict:
-    if state.get("turn_count", 0) > 0:
-        return {} # Skips database query on subsequent turns
-    return node_load_ltm(state, ltm)
-```
-* **`node_chat`**: Implements the Sliding Window (Layer 1). It slices `messages[-WINDOW_SIZE:]` to strictly enforce the context limit.
-```python
-def node_chat(state: AgentState) -> dict:
-    ...
-    window_msgs.extend(messages[-WINDOW_SIZE:])
-    reply = _ollama_complete(system, window_msgs)
-    return {
-        "messages": [AIMessage(content=reply)],
-        "turn_count": state.get("turn_count", 0) + 1,
-    }
-```
-* **`node_summarise`**: Implements Summary Memory (Layer 2). It isolates the older overflow messages, prompts the LLM to compress them, and returns `RemoveMessage` objects to physically delete them.
-```python
-def node_summarise(state: AgentState) -> dict:
-    overflow_count = len(messages) - WINDOW_SIZE
-    to_compress = messages[:overflow_count]
-    ...
-    removals = [RemoveMessage(id=m.id) for m in to_compress]
-    return {"summary": accumulated, "messages": removals}
-```
-* **`router_should_summarise`**: A conditional edge. Evaluates if `len(messages) > WINDOW_SIZE` to trigger compression.
-```python
-def router_should_summarise(state: AgentState) -> Literal["summarise", "__end__"]:
-    if len(state["messages"]) > WINDOW_SIZE:
-        return "summarise"
-    return "__end__"
-```
+* **Adapter for Embeddings (`OllamaChromaEF`)**:
+  ChromaDB requires an `EmbeddingFunction` class to know how to turn text into vectors. We create a custom class that wraps `langchain_ollama.OllamaEmbeddings` so ChromaDB knows to ping Ollama for the embeddings.
+  ```python
+  class OllamaChromaEF(EmbeddingFunction):
+      def __init__(self, model=EMBED_MODEL, base_url=OLLAMA_BASE_URL):
+          self._emb = OllamaEmbeddings(model=model, base_url=base_url)
+
+      def __call__(self, input: Documents) -> Embeddings:
+          # Converts a list of text strings into a list of vector arrays
+          return self._emb.embed_documents(list(input))
+  ```
+
+* **Retrieval & Storage (`LongTermMemory`)**:
+  The memory object initializes the database locally in the project directory.
+  ```python
+  def retrieve(self, user_id: str, query: str = "...", n: int = 3) -> str:
+      # We query the collection using semantic search.
+      # The where={"user_id": user_id} ensures we ONLY search this specific user's memories!
+      results = self.col.query(
+          query_texts=[query],
+          n_results=n,
+          where={"user_id": user_id} 
+      )
+      # Then we extract and format the resulting strings
+      ...
+
+  def store(self, user_id: str, facts: str, session_id: str):
+      # Upsert is critical: it overwrites if the ID exists, or creates if it doesn't.
+      # The ID is deterministic (user + session), preventing duplicates.
+      doc_id = f"{user_id}_{session_id}"
+      self.col.upsert(
+          ids=[doc_id],
+          documents=[facts], # The plain english facts generated by the LLM
+          metadatas=[{"user_id": user_id, "session_id": session_id}]
+      )
+  ```
+
+### 4.3 `graph.py` - LangGraph Flow and Logic (The State Machine)
+
+LangGraph manages the immediate context window (Layer 1) and the dynamic summary memory (Layer 2).
+
+* **Defining the State**:
+  The `AgentState` defines the data that flows through the graph. The `add_messages` reducer tells LangGraph how to update the message list (e.g., appending new ones or removing deleted ones).
+  ```python
+  class AgentState(TypedDict):
+      messages: Annotated[list[AnyMessage], add_messages]
+      summary: str
+      user_id: str
+      session_id: str
+      lt_context: str
+      turn_count: int
+  ```
+
+* **Node: Chat (Layer 1 - Sliding Window)**:
+  This function executes every single time the user sends a message.
+  ```python
+  def node_chat(state: AgentState) -> dict:
+      messages = state["messages"]
+      summary = state.get("summary", "")
+
+      # 1. We start by building the context window.
+      window_msgs = []
+      
+      # 2. If Layer 2 (Summary) exists, we inject it synthetically as a fake Human/AI pair
+      if summary:
+          window_msgs.append(HumanMessage(content="[System note: earlier summary]"))
+          window_msgs.append(AIMessage(content=summary))
+
+      # 3. Sliding Window Strategy: Only take the last 10 messages
+      window_msgs.extend(messages[-WINDOW_SIZE:])
+      
+      # 4. Generate the reply using the LLM
+      system = build_system_prompt(state.get("lt_context", ""))
+      reply = _ollama_complete(system, window_msgs)
+
+      # 5. Return the new message to be appended to the state
+      return {"messages": [AIMessage(content=reply)]}
+  ```
+
+* **Node: Summarise (Layer 2 - Semantic Compression)**:
+  If the sliding window overflows, this node compresses the old data.
+  ```python
+  def node_summarise(state: AgentState) -> dict:
+      # Calculate how many messages are over the limit
+      overflow_count = len(messages) - WINDOW_SIZE
+      
+      # Slice out the old messages that are about to be dropped
+      to_compress = messages[:overflow_count]
+
+      # Prompt the LLM to compress them into 2-3 sentences
+      summarise_system = "You are a precise summariser... Output ONLY a 2-3 sentence summary."
+      new_piece = _ollama_complete(summarise_system, [...])
+
+      # Crucially: Return RemoveMessage objects. LangGraph sees these and deletes
+      # the old, uncompressed messages from RAM to save tokens.
+      removals = [RemoveMessage(id=m.id) for m in to_compress]
+      
+      return {"summary": new_piece, "messages": removals}
+  ```
+
+* **The Router**:
+  The conditional logic that triggers compression.
+  ```python
+  def router_should_summarise(state: AgentState) -> Literal["summarise", "__end__"]:
+      if len(state["messages"]) > WINDOW_SIZE:
+          return "summarise"
+      return "__end__"
+  ```
+
+* **Building the Graph**:
+  This binds all the nodes and edges into an executable application, utilizing a `MemorySaver` checkpointer to hold the state in RAM during the active session.
+  ```python
+  def build_graph(ltm: LongTermMemory):
+      g = StateGraph(AgentState)
+      g.add_node("load_ltm", _load_ltm)
+      g.add_node("chat", node_chat)
+      g.add_node("summarise", node_summarise)
+
+      g.set_entry_point("load_ltm")
+      g.add_edge("load_ltm", "chat")
+      
+      # Conditional edge evaluating if we need to summarize before ending the turn
+      g.add_conditional_edges("chat", router_should_summarise)
+      g.add_edge("summarise", END)
+
+      return g.compile(checkpointer=MemorySaver())
+  ```
 
 ### 4.4 `session.py` - Interaction Abstraction
-* **`BookstoreSession`**: Abstracts LangGraph's complex threading mechanisms. 
-  * **`__init__`**: Generates a unique `thread_id` to isolate the in-memory `MemorySaver` checkpointer.
+
+This file bridges the gap between the complex LangGraph execution and the simple CLI loop.
+
+* **Session Isolation (`thread_id`)**:
+  LangGraph tracks state using a `thread_id`. If user A and user B have the same thread ID, they share the same context window.
   ```python
-  self.session_id = str(uuid.uuid4())[:8]
-  self.config = {"configurable": {"thread_id": f"{user_id}_{self.session_id}"}}
+  class BookstoreSession:
+      def __init__(self, app, ltm, user_id: str):
+          # We attach a random UUID suffix. 
+          # This guarantees that if "mohit" logs out and logs back in, he gets
+          # a fresh short-term memory slate, preventing previous context from bleeding in.
+          self.thread_id = f"{user_id}_{str(uuid.uuid4())[:8]}"
   ```
-  * **`end()`**: Wraps up the conversation by retrieving the final graph state, extracting facts, and saving them.
+
+* **Ending the Session (`end()`)**:
+  When the user closes the app, we need to save the short-term memories into Layer 3 (ChromaDB).
   ```python
-  final_state = self.app.get_state(self.config).values
-  facts = extract_facts(final_state["messages"], final_state.get("summary", ""))
-  self.ltm.store(self.user_id, facts, self.session_id)
+      def end(self):
+          # Fetch the full state as it exists right now in RAM
+          snapshot = self.app.get_state({"configurable": {"thread_id": self.thread_id}})
+          state = snapshot.values
+          
+          # Call the extract_facts LLM helper (from graph.py) to read the whole conversation
+          # and output plain English facts (e.g. "User likes sci-fi").
+          facts = extract_facts(state["messages"], state.get("summary", ""))
+          
+          # Save those prose facts to the database
+          if facts:
+              self.ltm.store(self.user_id, facts, self.session_id)
   ```
 
 ### 4.5 `main.py` - The User Interface
-* **`run_interactive()`**: An infinite loop utilizing python's `input()` with a `finally` block to guarantee `session.end()` runs on crash/exit.
+
+The entry point of the script handles the continuous interaction loop.
+* **`run_interactive()`**: An infinite loop utilizing Python's `input()`. The most vital part is the `finally` block. Because `session.end()` must run to save memories to ChromaDB, the `try/finally` block guarantees that even if the user hits `Ctrl+C` to kill the script, the memory extraction still runs.
 ```python
 try:
     while True:
@@ -233,6 +303,7 @@ try:
         reply = session.chat(user_input)
         print(f"\n🤖 MannKiBot: {reply}\n")
 finally:
+    # Guaranteed to run on exit/crash!
     print("\nEnding session and saving memories...")
     if 'session' in locals():
         session.end()
